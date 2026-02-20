@@ -225,3 +225,4 @@ Library: TV Shows (show)
 
 Finished processing. Total estimated space saving: 73.00 GB
 ```
+<img width="996" height="743" alt="image" src="https://github.com/user-attachments/assets/0aa75c95-6f0e-4703-846b-d276177725b1" />
