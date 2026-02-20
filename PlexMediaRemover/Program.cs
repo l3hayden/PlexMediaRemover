@@ -12,6 +12,8 @@ var configPath = "config.json";
 bool force = false;
 int? unwatchedOverride = null;
 int? watchedOverride = null;
+var libraryFilter = new List<string>();
+bool listLibraries = false;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -24,6 +26,8 @@ for (int i = 0; i < args.Length; i++)
         Console.WriteLine("Options:");
         Console.WriteLine("  -config <path>        Path to config JSON file (default: config.json)");
         Console.WriteLine("  -log <path>           Path to log output file (optional)");
+        Console.WriteLine("  -lib <name>           Target a specific library by name (can be repeated)");
+        Console.WriteLine("                          If omitted, prompted interactively or uses config TargetLibraries");
         Console.WriteLine("  -u, -unwatched <n>    Override unwatched threshold in months");
         Console.WriteLine("                        Deletes if never watched and added more than <n> months ago");
         Console.WriteLine("  -w, -watched <n>      Override watched threshold in months");
@@ -32,9 +36,11 @@ for (int i = 0; i < args.Length; i++)
         Console.WriteLine("  -help, --help         Show this help message");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  PlexMediaRemover                          Dry run with config.json");
-        Console.WriteLine("  PlexMediaRemover -force                   Delete media matching configured rules");
-        Console.WriteLine("  PlexMediaRemover -u 6 -w 3 -force         Override thresholds and delete");
+        Console.WriteLine("  PlexMediaRemover                               Dry run, prompted to pick library");
+        Console.WriteLine("  PlexMediaRemover -force                        Delete media in all libraries");
+        Console.WriteLine("  PlexMediaRemover -lib \"Movies\" -force          Process only the Movies library");
+        Console.WriteLine("  PlexMediaRemover -lib Movies -lib \"TV Shows\"   Multiple specific libraries");
+        Console.WriteLine("  PlexMediaRemover -u 6 -w 3 -force              Override thresholds and delete");
         Console.WriteLine("  PlexMediaRemover -config my.json -log out.txt");
         return;
     }
@@ -42,6 +48,13 @@ for (int i = 0; i < args.Length; i++)
     else if (args[i] == "-log" && i + 1 < args.Length) Logger.LogPath = args[++i];
     else if ((args[i] == "-u" || args[i] == "-unwatched") && i + 1 < args.Length && int.TryParse(args[++i], out int u)) unwatchedOverride = u;
     else if ((args[i] == "-w" || args[i] == "-watched") && i + 1 < args.Length && int.TryParse(args[++i], out int w)) watchedOverride = w;
+    else if (args[i] == "-lib")
+    {
+        if (i + 1 < args.Length)
+            libraryFilter.Add(args[++i]);
+        else
+            listLibraries = true;
+    }
     else if (args[i] == "-force") force = true;
 }
 
@@ -147,6 +160,80 @@ if (libraries == null || libraries.Count == 0)
     return;
 }
 
+var processableLibs = libraries.Where(l => l.Type == "movie" || l.Type == "show").ToList();
+
+if (processableLibs.Count == 0)
+{
+    Logger.Log("No movie or show libraries found in Plex.");
+    return;
+}
+
+if (listLibraries)
+{
+    Logger.Log("Available libraries:");
+    foreach (var l in processableLibs)
+        Logger.Log($"  - {l.Title} ({l.Type})");
+    return;
+}
+
+// Determine which libraries to process
+List<PlexDirectory> selectedLibraries;
+var combinedFilter = libraryFilter.Count > 0 ? libraryFilter : config.TargetLibraries;
+
+if (combinedFilter != null && combinedFilter.Count > 0)
+{
+    selectedLibraries = processableLibs
+        .Where(l => combinedFilter.Any(f => f.Equals(l.Title, StringComparison.OrdinalIgnoreCase)))
+        .ToList();
+
+    if (selectedLibraries.Count == 0)
+    {
+        Logger.Log("ERROR: No libraries matched the specified filter. Available libraries:");
+        foreach (var l in processableLibs)
+            Logger.Log($"  - {l.Title} ({l.Type})");
+        return;
+    }
+
+    Logger.Log($"Targeting {selectedLibraries.Count} library(s): {string.Join(", ", selectedLibraries.Select(l => l.Title))}");
+}
+else if (!Console.IsInputRedirected)
+{
+    Logger.Log("\nAvailable libraries:");
+    for (int li = 0; li < processableLibs.Count; li++)
+        Logger.Log($"  [{li + 1}] {processableLibs[li].Title} ({processableLibs[li].Type})");
+
+    Console.Write("\nEnter library numbers to process (comma-separated), or press Enter for all: ");
+    var input = Console.ReadLine()?.Trim();
+
+    if (string.IsNullOrEmpty(input))
+    {
+        selectedLibraries = processableLibs;
+        Logger.Log("Processing all libraries.");
+    }
+    else
+    {
+        selectedLibraries = new List<PlexDirectory>();
+        foreach (var part in input.Split(','))
+        {
+            if (int.TryParse(part.Trim(), out int idx) && idx >= 1 && idx <= processableLibs.Count)
+                selectedLibraries.Add(processableLibs[idx - 1]);
+        }
+
+        if (selectedLibraries.Count == 0)
+        {
+            Logger.Log("No valid libraries selected. Exiting.");
+            return;
+        }
+
+        Logger.Log($"Selected: {string.Join(", ", selectedLibraries.Select(l => l.Title))}");
+    }
+}
+else
+{
+    selectedLibraries = processableLibs;
+    Logger.Log($"Processing all {selectedLibraries.Count} library(s).");
+}
+
 var now = DateTimeOffset.UtcNow;
 long grandTotalBytesSaved = 0;
 var librarySummaries = new List<LibrarySummary>();
@@ -155,11 +242,8 @@ int deletedFromSonarr = 0;
 int deletedFromPlex = 0;
 var deletionErrors = new List<string>();
 
-foreach (var lib in libraries)
+foreach (var lib in selectedLibraries)
 {
-    // Only process movie and show libraries
-    if (lib.Type != "movie" && lib.Type != "show") continue;
-
     Logger.Log($"\nProcessing library: {lib.Title} ({lib.Type})");
     var items = await plexClient.GetLibraryItemsAsync(lib.Key);
 
@@ -292,6 +376,7 @@ foreach (var lib in libraries)
 
 Logger.Log("\n--- Summary ---");
 Logger.Log($"Mode:              {(force ? "FORCE (deletions performed)" : "DRY RUN (no deletions)")}");
+Logger.Log($"Libraries:         {string.Join(", ", selectedLibraries.Select(l => $"{l.Title} ({l.Type})"))}");
 Logger.Log($"Unwatched rule:    Delete if not watched within {config.Rules.DeleteUnwatchedMonths} month(s) of being added");
 Logger.Log($"Watched rule:      Delete if last watched more than {config.Rules.DeleteWatchedMonths} month(s) ago");
 Logger.Log($"Config file:       {configPath}");
@@ -339,7 +424,7 @@ string FormatBytes(long bytes)
 
 // --- Models ---
 public record LibrarySummary(string Title, string Type, int TotalItems, long TotalSizeBytes, int DeletedItems, long DeletedSizeBytes);
-public record AppConfig(PlexConfig? Plex, RadarrConfig? Radarr, SonarrConfig? Sonarr, TautulliConfig? Tautulli, RemovalRules? Rules);
+public record AppConfig(PlexConfig? Plex, RadarrConfig? Radarr, SonarrConfig? Sonarr, TautulliConfig? Tautulli, RemovalRules? Rules, List<string>? TargetLibraries = null);
 public record PlexConfig(string Url, string Token);
 public record RadarrConfig(string Url, string Token);
 public record SonarrConfig(string Url, string Token);
