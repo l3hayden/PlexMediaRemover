@@ -22,24 +22,57 @@ for (int i = 0; i < args.Length; i++)
     else if (args[i] == "-force") force = true;
 }
 
+var defaultConfig = new AppConfig(
+    new PlexConfig("http://localhost:32400", "YOUR_PLEX_TOKEN"),
+    new RadarrConfig("http://localhost:7878", "YOUR_RADARR_TOKEN"),
+    new SonarrConfig("http://localhost:8989", "YOUR_SONARR_TOKEN"),
+    new TautulliConfig("http://localhost:8181", "YOUR_TAUTULLI_API_KEY"),
+    new RemovalRules(12, 6)
+);
+
 if (!File.Exists(configPath))
 {
-    var defaultConfig = new AppConfig(
-        new PlexConfig("http://localhost:32400", "YOUR_PLEX_TOKEN"),
-        new RadarrConfig("http://localhost:7878", "YOUR_RADARR_TOKEN"),
-        new SonarrConfig("http://localhost:8989", "YOUR_SONARR_TOKEN"),
-        new RemovalRules(12, 6)
-    );
     var json = JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true });
     await File.WriteAllTextAsync(configPath, json);
     Logger.Log($"Created default config at {configPath}. Please update it with your API tokens and run again.");
     return;
 }
 
-var config = JsonSerializer.Deserialize<AppConfig>(await File.ReadAllTextAsync(configPath));
+var configText = await File.ReadAllTextAsync(configPath);
+var config = JsonSerializer.Deserialize<AppConfig>(configText);
+
 if (config == null)
 {
     Logger.Log("Failed to load config.");
+    return;
+}
+
+// Check for missing config sections and update if necessary
+bool configUpdated = false;
+if (config.Plex == null) { config = config with { Plex = defaultConfig.Plex }; configUpdated = true; }
+if (config.Radarr == null) { config = config with { Radarr = defaultConfig.Radarr }; configUpdated = true; }
+if (config.Sonarr == null) { config = config with { Sonarr = defaultConfig.Sonarr }; configUpdated = true; }
+if (config.Tautulli == null) { config = config with { Tautulli = defaultConfig.Tautulli }; configUpdated = true; }
+if (config.Rules == null) { config = config with { Rules = defaultConfig.Rules }; configUpdated = true; }
+
+if (configUpdated)
+{
+    var updatedJson = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+    await File.WriteAllTextAsync(configPath, updatedJson);
+    Logger.Log($"Updated config file at {configPath} with missing sections.");
+}
+
+bool IsValidUrl(string? url) => Uri.TryCreate(url, UriKind.Absolute, out var uriResult) && (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps);
+
+if (!IsValidUrl(config.Plex?.Url) || !IsValidUrl(config.Radarr?.Url) || !IsValidUrl(config.Sonarr?.Url) || !IsValidUrl(config.Tautulli?.Url))
+{
+    Logger.Log("ERROR: One or more URLs in the config are invalid. Please ensure they are properly formatted (e.g., http://192.168.1.100:32400). Exiting.");
+    return;
+}
+
+if (string.IsNullOrWhiteSpace(config.Tautulli?.ApiKey) || config.Tautulli.ApiKey == "YOUR_TAUTULLI_API_KEY")
+{
+    Logger.Log("ERROR: Tautulli is not configured. Tautulli is REQUIRED to safely determine global watch status. Exiting.");
     return;
 }
 
@@ -68,6 +101,7 @@ using var httpClient = new HttpClient();
 var plexClient = new PlexClient(httpClient, config.Plex);
 var radarrClient = new RadarrClient(httpClient, config.Radarr);
 var sonarrClient = new SonarrClient(httpClient, config.Sonarr);
+var tautulliClient = new TautulliClient(httpClient, config.Tautulli);
 
 Logger.Log("Fetching Plex libraries...");
 var libraries = await plexClient.GetLibrariesAsync();
@@ -98,9 +132,6 @@ foreach (var lib in libraries)
     foreach (var item in items)
     {
         long itemSizeBytes = 0;
-        int aggregatedViewCount = item.ViewCount;
-        long aggregatedLastViewedAt = item.LastViewedAt;
-        long aggregatedViewOffset = item.ViewOffset;
 
         if (lib.Type == "movie")
         {
@@ -120,20 +151,9 @@ foreach (var lib in libraries)
         }
         else if (lib.Type == "show")
         {
-            aggregatedViewCount = 0;
-            aggregatedLastViewedAt = 0;
-            aggregatedViewOffset = 0;
-
             var episodes = await plexClient.GetMetadataLeavesAsync(item.RatingKey);
             foreach (var ep in episodes)
             {
-                aggregatedViewCount += ep.ViewCount;
-                aggregatedViewOffset += ep.ViewOffset;
-                if (ep.LastViewedAt > aggregatedLastViewedAt)
-                {
-                    aggregatedLastViewedAt = ep.LastViewedAt;
-                }
-
                 if (ep.Media != null)
                 {
                     foreach (var media in ep.Media)
@@ -148,10 +168,6 @@ foreach (var lib in libraries)
                     }
                 }
             }
-
-            // Fallback to show-level properties just in case
-            if (aggregatedViewCount == 0 && item.ViewedLeafCount > 0) aggregatedViewCount = item.ViewedLeafCount;
-            if (aggregatedLastViewedAt == 0 && item.LastViewedAt > 0) aggregatedLastViewedAt = item.LastViewedAt;
         }
 
         libTotalBytes += itemSizeBytes;
@@ -160,9 +176,16 @@ foreach (var lib in libraries)
         string reason = "";
 
         var addedAt = DateTimeOffset.FromUnixTimeSeconds(item.AddedAt);
-        var lastViewedAt = aggregatedLastViewedAt > 0 ? DateTimeOffset.FromUnixTimeSeconds(aggregatedLastViewedAt) : (DateTimeOffset?)null;
 
-        bool isUnwatched = aggregatedViewCount == 0 && aggregatedViewOffset == 0;
+        // Check Tautulli for global watch stats
+        var tautulliStats = await tautulliClient.GetItemWatchStatsAsync(item.RatingKey);
+
+        long globalLastViewedAt = tautulliStats?.LastViewedAt ?? 0;
+        int globalViewCount = tautulliStats?.PlayCount ?? 0;
+
+        var lastViewedAt = globalLastViewedAt > 0 ? DateTimeOffset.FromUnixTimeSeconds(globalLastViewedAt) : (DateTimeOffset?)null;
+
+        bool isUnwatched = globalViewCount == 0;
 
         if (isUnwatched)
         {
@@ -249,10 +272,11 @@ string FormatBytes(long bytes)
 
 // --- Models ---
 public record LibrarySummary(string Title, string Type, int TotalItems, long TotalSizeBytes, int DeletedItems, long DeletedSizeBytes);
-public record AppConfig(PlexConfig Plex, RadarrConfig Radarr, SonarrConfig Sonarr, RemovalRules Rules);
+public record AppConfig(PlexConfig Plex, RadarrConfig Radarr, SonarrConfig Sonarr, TautulliConfig Tautulli, RemovalRules Rules);
 public record PlexConfig(string Url, string Token);
 public record RadarrConfig(string Url, string Token);
 public record SonarrConfig(string Url, string Token);
+public record TautulliConfig(string Url, string ApiKey);
 public record RemovalRules(int DeleteUnwatchedMonths, int DeleteWatchedMonths);
 
 // --- Clients ---
@@ -394,6 +418,57 @@ public class PlexMedia { public List<PlexPart>? Part { get; set; } }
 public class PlexPart { public long Size { get; set; } }
 public class RadarrMovie { public int Id { get; set; } public string Title { get; set; } = ""; }
 public class SonarrSeries { public int Id { get; set; } public string Title { get; set; } = ""; }
+
+public class TautulliClient
+{
+    private readonly HttpClient _http;
+    private readonly TautulliConfig _config;
+
+    public TautulliClient(HttpClient http, TautulliConfig config)
+    {
+        _http = http;
+        _config = config;
+    }
+
+    public async Task<TautulliItemStats?> GetItemWatchStatsAsync(string ratingKey)
+    {
+        if (string.IsNullOrEmpty(_config.ApiKey) || _config.ApiKey == "YOUR_TAUTULLI_API_KEY") return null;
+
+        var url = $"{_config.Url.TrimEnd('/')}/api/v2?apikey={_config.ApiKey}&cmd=get_history&rating_key={ratingKey}&length=1&order_column=date&order_dir=desc";
+        var res = await _http.GetAsync(url);
+        if (!res.IsSuccessStatusCode) return null;
+
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var data = await res.Content.ReadFromJsonAsync<TautulliResponse>(options);
+        if (data?.Response == null) return null;
+
+        long lastViewedAt = 0;
+        if (data.Response.Data.ValueKind == JsonValueKind.Array)
+        {
+            var historyItems = data.Response.Data.Deserialize<List<TautulliHistoryItem>>(options);
+            lastViewedAt = historyItems?.FirstOrDefault()?.Date ?? 0;
+        }
+
+        return new TautulliItemStats 
+        {
+            PlayCount = data.Response.RecordsFiltered,
+            LastViewedAt = lastViewedAt
+        };
+    }
+}
+
+public class TautulliResponse { public TautulliResponseData? Response { get; set; } }
+public class TautulliResponseData { 
+    public int RecordsFiltered { get; set; }
+    public JsonElement Data { get; set; } 
+}
+public class TautulliHistoryItem { 
+    public long Date { get; set; } 
+}
+public class TautulliItemStats { 
+    public int PlayCount { get; set; } 
+    public long LastViewedAt { get; set; } 
+}
 
 public static class Logger
 {

@@ -9,6 +9,7 @@ To prevent media from being automatically re-downloaded, it also integrates with
 - **Automated Cleanup**: Removes media based on configurable time thresholds.
   - Delete media added over `X` months ago that has never been watched.
   - Delete media that was watched, but hasn't been viewed in the last `Y` months.
+- **Tautulli Integration**: Uses Tautulli to check global watch stats across all users on your server.
 - **Radarr & Sonarr Integration**: Ensures deleted media is also removed from your *arr apps so it doesn't get grabbed again.
 - **Dry Run Mode**: Safely test your rules without actually deleting any files.
 - **Space Savings Estimation**: Calculates and displays the total file size of the media being removed.
@@ -40,6 +41,10 @@ On the first run, the application will generate a `config.json` file in the same
     "Url": "http://localhost:8989",
     "Token": "YOUR_SONARR_TOKEN"
   },
+  "Tautulli": {
+    "Url": "http://localhost:8181",
+    "ApiKey": "YOUR_TAUTULLI_API_KEY"
+  },
   "Rules": {
     "DeleteUnwatchedMonths": 12,
     "DeleteWatchedMonths": 6
@@ -48,6 +53,10 @@ On the first run, the application will generate a `config.json` file in the same
 ```
 
 *Note: The application runs in Dry Run mode by default. No files will be deleted unless you pass the `-force` argument.*
+
+### Important Tautulli Setting
+To ensure that even partial watches are tracked correctly by this script, you must configure Tautulli to log all play history immediately. 
+In Tautulli, go to **Settings -> History Logging** and set the **Ignore Interval** to `0`.
 
 ## Example Output
 
