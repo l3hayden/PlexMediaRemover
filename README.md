@@ -92,7 +92,24 @@ On the first run, the application generates a `config.json` file in the working 
 | `Tautulli.Url` / `Tautulli.ApiKey` | Tautulli URL and API key. **Required.** |
 | `Rules.DeleteUnwatchedMonths` | Delete media that has never been watched if it was added more than this many months ago. Must be a positive integer. |
 | `Rules.DeleteWatchedMonths` | Delete media whose last watch was more than this many months ago. Must be a positive integer. |
+| `Rules.MinimumAddedDate` | Optional. Items with an `addedAt` date before this value are **always skipped**, regardless of other rules. Use format `YYYY-MM-DD`. Useful when Plex recorded old file timestamps instead of the real library-add date (see note below). |
 | `TargetLibraries` | Optional list of library names to process. If empty or omitted, all movie and show libraries are candidates (an interactive prompt is shown when running in a terminal). |
+
+### A note on `addedAt` and old libraries
+
+Plex stores `addedAt` as the date an item was **added to your Plex library**, which is different from the content's original release date (`originallyAvailableAt`). However, when Plex first scans an existing collection of files, it sometimes uses the **file's filesystem creation or modification timestamp** as `addedAt`. If your files have been on disk since 2005, Plex may record 2005 as the add date.
+
+If you see unexpectedly large month values (e.g. 200+ months), set `MinimumAddedDate` to a safe floor:
+
+```json
+"Rules": {
+  "DeleteUnwatchedMonths": 12,
+  "DeleteWatchedMonths": 6,
+  "MinimumAddedDate": "2020-01-01"
+}
+```
+
+Items with an `addedAt` before that date will be logged as `[SKIP]` and left untouched. Items with a **missing** `addedAt` (value `0`) are also always skipped.
 
 ### Config Validation
 

@@ -118,6 +118,12 @@ if (config.Rules.DeleteUnwatchedMonths <= 0 || config.Rules.DeleteWatchedMonths 
     return;
 }
 
+if (config.Rules.MinimumAddedDate != null && !DateTimeOffset.TryParse(config.Rules.MinimumAddedDate, out _))
+{
+    Logger.Log($"ERROR: Rules.MinimumAddedDate '{config.Rules.MinimumAddedDate}' is not a valid date. Use format YYYY-MM-DD. Exiting.");
+    return;
+}
+
 if (string.IsNullOrWhiteSpace(config.Tautulli.ApiKey) || config.Tautulli.ApiKey == "YOUR_TAUTULLI_API_KEY")
 {
     Logger.Log("ERROR: Tautulli is not configured. Tautulli is REQUIRED to safely determine global watch status. Exiting.");
@@ -298,7 +304,21 @@ foreach (var lib in selectedLibraries)
         bool shouldDelete = false;
         string reason = "";
 
+        if (item.AddedAt == 0)
+        {
+            Logger.Log($"  [SKIP] {item.Title} - AddedAt timestamp is missing. Skipping to avoid unsafe deletion.");
+            continue;
+        }
+
         var addedAt = DateTimeOffset.FromUnixTimeSeconds(item.AddedAt);
+
+        if (config.Rules.MinimumAddedDate != null &&
+            DateTimeOffset.TryParse(config.Rules.MinimumAddedDate, out var minDate) &&
+            addedAt < minDate)
+        {
+            Logger.Log($"  [SKIP] {item.Title} - Added {addedAt:yyyy-MM-dd}, before MinimumAddedDate ({config.Rules.MinimumAddedDate}). Skipping.");
+            continue;
+        }
 
         // Check Tautulli for global watch stats
         var tautulliStats = await tautulliClient.GetItemWatchStatsAsync(item.RatingKey, lib.Type == "show");
@@ -379,6 +399,8 @@ Logger.Log($"Mode:              {(force ? "FORCE (deletions performed)" : "DRY R
 Logger.Log($"Libraries:         {string.Join(", ", selectedLibraries.Select(l => $"{l.Title} ({l.Type})"))}");
 Logger.Log($"Unwatched rule:    Delete if not watched within {config.Rules.DeleteUnwatchedMonths} month(s) of being added");
 Logger.Log($"Watched rule:      Delete if last watched more than {config.Rules.DeleteWatchedMonths} month(s) ago");
+if (config.Rules.MinimumAddedDate != null)
+    Logger.Log($"Min added date:    {config.Rules.MinimumAddedDate} (items added before this date are skipped)");
 Logger.Log($"Config file:       {configPath}");
 Logger.Log("");
 foreach (var summary in librarySummaries)
@@ -429,7 +451,7 @@ public record PlexConfig(string Url, string Token);
 public record RadarrConfig(string Url, string Token);
 public record SonarrConfig(string Url, string Token);
 public record TautulliConfig(string Url, string ApiKey);
-public record RemovalRules(int DeleteUnwatchedMonths, int DeleteWatchedMonths);
+public record RemovalRules(int DeleteUnwatchedMonths, int DeleteWatchedMonths, string? MinimumAddedDate = null);
 
 // --- Clients ---
 public class PlexClient
