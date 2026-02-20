@@ -98,6 +98,9 @@ foreach (var lib in libraries)
     foreach (var item in items)
     {
         long itemSizeBytes = 0;
+        int aggregatedViewCount = item.ViewCount;
+        long aggregatedLastViewedAt = item.LastViewedAt;
+        long aggregatedViewOffset = item.ViewOffset;
 
         if (lib.Type == "movie")
         {
@@ -117,9 +120,20 @@ foreach (var lib in libraries)
         }
         else if (lib.Type == "show")
         {
+            aggregatedViewCount = 0;
+            aggregatedLastViewedAt = 0;
+            aggregatedViewOffset = 0;
+
             var episodes = await plexClient.GetMetadataLeavesAsync(item.RatingKey);
             foreach (var ep in episodes)
             {
+                aggregatedViewCount += ep.ViewCount;
+                aggregatedViewOffset += ep.ViewOffset;
+                if (ep.LastViewedAt > aggregatedLastViewedAt)
+                {
+                    aggregatedLastViewedAt = ep.LastViewedAt;
+                }
+
                 if (ep.Media != null)
                 {
                     foreach (var media in ep.Media)
@@ -134,6 +148,10 @@ foreach (var lib in libraries)
                     }
                 }
             }
+
+            // Fallback to show-level properties just in case
+            if (aggregatedViewCount == 0 && item.ViewedLeafCount > 0) aggregatedViewCount = item.ViewedLeafCount;
+            if (aggregatedLastViewedAt == 0 && item.LastViewedAt > 0) aggregatedLastViewedAt = item.LastViewedAt;
         }
 
         libTotalBytes += itemSizeBytes;
@@ -142,9 +160,9 @@ foreach (var lib in libraries)
         string reason = "";
 
         var addedAt = DateTimeOffset.FromUnixTimeSeconds(item.AddedAt);
-        var lastViewedAt = item.LastViewedAt > 0 ? DateTimeOffset.FromUnixTimeSeconds(item.LastViewedAt) : (DateTimeOffset?)null;
+        var lastViewedAt = aggregatedLastViewedAt > 0 ? DateTimeOffset.FromUnixTimeSeconds(aggregatedLastViewedAt) : (DateTimeOffset?)null;
 
-        bool isUnwatched = lib.Type == "show" ? item.ViewedLeafCount == 0 : item.ViewCount == 0;
+        bool isUnwatched = aggregatedViewCount == 0 && aggregatedViewOffset == 0;
 
         if (isUnwatched)
         {
@@ -369,6 +387,7 @@ public class PlexMetadata {
     public long LastViewedAt { get; set; }
     public int ViewCount { get; set; }
     public int ViewedLeafCount { get; set; }
+    public long ViewOffset { get; set; }
     public List<PlexMedia>? Media { get; set; }
 }
 public class PlexMedia { public List<PlexPart>? Part { get; set; } }
