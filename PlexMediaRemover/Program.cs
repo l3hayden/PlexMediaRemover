@@ -15,7 +15,30 @@ int? watchedOverride = null;
 
 for (int i = 0; i < args.Length; i++)
 {
-    if (args[i] == "-config" && i + 1 < args.Length) configPath = args[++i];
+    if (args[i] == "-help" || args[i] == "--help")
+    {
+        Console.WriteLine("PlexMediaRemover - Automatically removes media from Plex/Radarr/Sonarr based on watch history.");
+        Console.WriteLine();
+        Console.WriteLine("Usage: PlexMediaRemover [options]");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  -config <path>        Path to config JSON file (default: config.json)");
+        Console.WriteLine("  -log <path>           Path to log output file (optional)");
+        Console.WriteLine("  -u, -unwatched <n>    Override unwatched threshold in months");
+        Console.WriteLine("                        Deletes if never watched and added more than <n> months ago");
+        Console.WriteLine("  -w, -watched <n>      Override watched threshold in months");
+        Console.WriteLine("                        Deletes if last watched more than <n> months ago");
+        Console.WriteLine("  -force                Actually delete media (default is dry run, no deletions)");
+        Console.WriteLine("  -help, --help         Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  PlexMediaRemover                          Dry run with config.json");
+        Console.WriteLine("  PlexMediaRemover -force                   Delete media matching configured rules");
+        Console.WriteLine("  PlexMediaRemover -u 6 -w 3 -force         Override thresholds and delete");
+        Console.WriteLine("  PlexMediaRemover -config my.json -log out.txt");
+        return;
+    }
+    else if (args[i] == "-config" && i + 1 < args.Length) configPath = args[++i];
     else if (args[i] == "-log" && i + 1 < args.Length) Logger.LogPath = args[++i];
     else if ((args[i] == "-u" || args[i] == "-unwatched") && i + 1 < args.Length && int.TryParse(args[++i], out int u)) unwatchedOverride = u;
     else if ((args[i] == "-w" || args[i] == "-watched") && i + 1 < args.Length && int.TryParse(args[++i], out int w)) watchedOverride = w;
@@ -62,15 +85,27 @@ if (configUpdated)
     Logger.Log($"Updated config file at {configPath} with missing sections.");
 }
 
+if (config.Plex is null || config.Radarr is null || config.Sonarr is null || config.Tautulli is null || config.Rules is null)
+{
+    Logger.Log("ERROR: Config file is missing required sections. Delete it and restart to regenerate defaults.");
+    return;
+}
+
 bool IsValidUrl(string? url) => Uri.TryCreate(url, UriKind.Absolute, out var uriResult) && (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps);
 
-if (!IsValidUrl(config.Plex?.Url) || !IsValidUrl(config.Radarr?.Url) || !IsValidUrl(config.Sonarr?.Url) || !IsValidUrl(config.Tautulli?.Url))
+if (!IsValidUrl(config.Plex.Url) || !IsValidUrl(config.Radarr.Url) || !IsValidUrl(config.Sonarr.Url) || !IsValidUrl(config.Tautulli.Url))
 {
     Logger.Log("ERROR: One or more URLs in the config are invalid. Please ensure they are properly formatted (e.g., http://192.168.1.100:32400). Exiting.");
     return;
 }
 
-if (string.IsNullOrWhiteSpace(config.Tautulli?.ApiKey) || config.Tautulli.ApiKey == "YOUR_TAUTULLI_API_KEY")
+if (config.Rules.DeleteUnwatchedMonths <= 0 || config.Rules.DeleteWatchedMonths <= 0)
+{
+    Logger.Log($"ERROR: Rule thresholds must be positive integers. Got: DeleteUnwatchedMonths={config.Rules.DeleteUnwatchedMonths}, DeleteWatchedMonths={config.Rules.DeleteWatchedMonths}. Exiting.");
+    return;
+}
+
+if (string.IsNullOrWhiteSpace(config.Tautulli.ApiKey) || config.Tautulli.ApiKey == "YOUR_TAUTULLI_API_KEY")
 {
     Logger.Log("ERROR: Tautulli is not configured. Tautulli is REQUIRED to safely determine global watch status. Exiting.");
     return;
@@ -115,6 +150,10 @@ if (libraries == null || libraries.Count == 0)
 var now = DateTimeOffset.UtcNow;
 long grandTotalBytesSaved = 0;
 var librarySummaries = new List<LibrarySummary>();
+int deletedFromRadarr = 0;
+int deletedFromSonarr = 0;
+int deletedFromPlex = 0;
+var deletionErrors = new List<string>();
 
 foreach (var lib in libraries)
 {
@@ -225,20 +264,25 @@ foreach (var lib in libraries)
                 // 1. Remove from Radarr/Sonarr
                 if (lib.Type == "movie")
                 {
-                    await radarrClient.DeleteMovieAsync(item.Title);
+                    if (await radarrClient.DeleteMovieAsync(item.Title))
+                        deletedFromRadarr++;
                 }
                 else if (lib.Type == "show")
                 {
-                    await sonarrClient.DeleteSeriesAsync(item.Title);
+                    if (await sonarrClient.DeleteSeriesAsync(item.Title))
+                        deletedFromSonarr++;
                 }
 
                 // 2. Remove from Plex
                 await plexClient.DeleteItemAsync(item.RatingKey);
+                deletedFromPlex++;
                 Logger.Log($"   -> Deleted '{item.Title}' from Plex.");
             }
             catch (Exception ex)
             {
-                Logger.Log($"   -> [ERROR] Failed to delete '{item.Title}': {ex.Message}");
+                var errMsg = $"'{item.Title}': {ex.Message}";
+                deletionErrors.Add(errMsg);
+                Logger.Log($"   -> [ERROR] Failed to delete {errMsg}");
             }
         }
     }
@@ -247,12 +291,35 @@ foreach (var lib in libraries)
 }
 
 Logger.Log("\n--- Summary ---");
+Logger.Log($"Mode:              {(force ? "FORCE (deletions performed)" : "DRY RUN (no deletions)")}");
+Logger.Log($"Unwatched rule:    Delete if not watched within {config.Rules.DeleteUnwatchedMonths} month(s) of being added");
+Logger.Log($"Watched rule:      Delete if last watched more than {config.Rules.DeleteWatchedMonths} month(s) ago");
+Logger.Log($"Config file:       {configPath}");
+Logger.Log("");
 foreach (var summary in librarySummaries)
 {
     Logger.Log($"Library: {summary.Title} ({summary.Type})");
     Logger.Log($"  Total Items: {summary.TotalItems}");
     Logger.Log($"  Total Size:  {FormatBytes(summary.TotalSizeBytes)}");
     Logger.Log($"  To Delete:   {summary.DeletedItems} items ({FormatBytes(summary.DeletedSizeBytes)})");
+}
+
+if (force)
+{
+    Logger.Log("\n--- Deletion Results ---");
+    Logger.Log($"  Radarr:  {deletedFromRadarr} deleted");
+    Logger.Log($"  Sonarr:  {deletedFromSonarr} deleted");
+    Logger.Log($"  Plex:    {deletedFromPlex} deleted");
+    if (deletionErrors.Count > 0)
+    {
+        Logger.Log($"\n  Errors ({deletionErrors.Count}):");
+        foreach (var err in deletionErrors)
+            Logger.Log($"    [ERROR] {err}");
+    }
+    else
+    {
+        Logger.Log("  No errors.");
+    }
 }
 
 Logger.Log($"\nFinished processing. Total estimated space saving: {FormatBytes(grandTotalBytesSaved)}");
@@ -272,7 +339,7 @@ string FormatBytes(long bytes)
 
 // --- Models ---
 public record LibrarySummary(string Title, string Type, int TotalItems, long TotalSizeBytes, int DeletedItems, long DeletedSizeBytes);
-public record AppConfig(PlexConfig Plex, RadarrConfig Radarr, SonarrConfig Sonarr, TautulliConfig Tautulli, RemovalRules Rules);
+public record AppConfig(PlexConfig? Plex, RadarrConfig? Radarr, SonarrConfig? Sonarr, TautulliConfig? Tautulli, RemovalRules? Rules);
 public record PlexConfig(string Url, string Token);
 public record RadarrConfig(string Url, string Token);
 public record SonarrConfig(string Url, string Token);
@@ -346,25 +413,26 @@ public class RadarrClient
         _config = config;
     }
 
-    public async Task DeleteMovieAsync(string title)
+    public async Task<bool> DeleteMovieAsync(string title)
     {
-        if (string.IsNullOrEmpty(_config.Token) || _config.Token == "YOUR_RADARR_TOKEN") return;
+        if (string.IsNullOrEmpty(_config.Token) || _config.Token == "YOUR_RADARR_TOKEN") return false;
 
         var req = new HttpRequestMessage(HttpMethod.Get, $"{_config.Url.TrimEnd('/')}/api/v3/movie");
         req.Headers.Add("X-Api-Key", _config.Token);
         var res = await _http.SendAsync(req);
-        if (!res.IsSuccessStatusCode) return;
+        if (!res.IsSuccessStatusCode) return false;
 
         var movies = await res.Content.ReadFromJsonAsync<List<RadarrMovie>>();
         var movie = movies?.FirstOrDefault(m => m.Title.Equals(title, StringComparison.OrdinalIgnoreCase));
 
-        if (movie != null)
-        {
-            var delReq = new HttpRequestMessage(HttpMethod.Delete, $"{_config.Url.TrimEnd('/')}/api/v3/movie/{movie.Id}?deleteFiles=true");
-            delReq.Headers.Add("X-Api-Key", _config.Token);
-            await _http.SendAsync(delReq);
-            Logger.Log($"   -> Deleted '{title}' from Radarr.");
-        }
+        if (movie == null) return false;
+
+        var delReq = new HttpRequestMessage(HttpMethod.Delete, $"{_config.Url.TrimEnd('/')}/api/v3/movie/{movie.Id}?deleteFiles=true");
+        delReq.Headers.Add("X-Api-Key", _config.Token);
+        var delRes = await _http.SendAsync(delReq);
+        delRes.EnsureSuccessStatusCode();
+        Logger.Log($"   -> Deleted '{title}' from Radarr.");
+        return true;
     }
 }
 
@@ -379,25 +447,26 @@ public class SonarrClient
         _config = config;
     }
 
-    public async Task DeleteSeriesAsync(string title)
+    public async Task<bool> DeleteSeriesAsync(string title)
     {
-        if (string.IsNullOrEmpty(_config.Token) || _config.Token == "YOUR_SONARR_TOKEN") return;
+        if (string.IsNullOrEmpty(_config.Token) || _config.Token == "YOUR_SONARR_TOKEN") return false;
 
         var req = new HttpRequestMessage(HttpMethod.Get, $"{_config.Url.TrimEnd('/')}/api/v3/series");
         req.Headers.Add("X-Api-Key", _config.Token);
         var res = await _http.SendAsync(req);
-        if (!res.IsSuccessStatusCode) return;
+        if (!res.IsSuccessStatusCode) return false;
 
         var series = await res.Content.ReadFromJsonAsync<List<SonarrSeries>>();
         var show = series?.FirstOrDefault(s => s.Title.Equals(title, StringComparison.OrdinalIgnoreCase));
 
-        if (show != null)
-        {
-            var delReq = new HttpRequestMessage(HttpMethod.Delete, $"{_config.Url.TrimEnd('/')}/api/v3/series/{show.Id}?deleteFiles=true");
-            delReq.Headers.Add("X-Api-Key", _config.Token);
-            await _http.SendAsync(delReq);
-            Logger.Log($"   -> Deleted '{title}' from Sonarr.");
-        }
+        if (show == null) return false;
+
+        var delReq = new HttpRequestMessage(HttpMethod.Delete, $"{_config.Url.TrimEnd('/')}/api/v3/series/{show.Id}?deleteFiles=true");
+        delReq.Headers.Add("X-Api-Key", _config.Token);
+        var delRes = await _http.SendAsync(delReq);
+        delRes.EnsureSuccessStatusCode();
+        Logger.Log($"   -> Deleted '{title}' from Sonarr.");
+        return true;
     }
 }
 
