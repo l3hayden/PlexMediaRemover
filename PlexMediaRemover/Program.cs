@@ -178,7 +178,7 @@ foreach (var lib in libraries)
         var addedAt = DateTimeOffset.FromUnixTimeSeconds(item.AddedAt);
 
         // Check Tautulli for global watch stats
-        var tautulliStats = await tautulliClient.GetItemWatchStatsAsync(item.RatingKey);
+        var tautulliStats = await tautulliClient.GetItemWatchStatsAsync(item.RatingKey, lib.Type == "show");
 
         long globalLastViewedAt = tautulliStats?.LastViewedAt ?? 0;
         int globalViewCount = tautulliStats?.PlayCount ?? 0;
@@ -430,37 +430,38 @@ public class TautulliClient
         _config = config;
     }
 
-    public async Task<TautulliItemStats?> GetItemWatchStatsAsync(string ratingKey)
+    public async Task<TautulliItemStats?> GetItemWatchStatsAsync(string ratingKey, bool isShow)
     {
         if (string.IsNullOrEmpty(_config.ApiKey) || _config.ApiKey == "YOUR_TAUTULLI_API_KEY") return null;
 
-        var url = $"{_config.Url.TrimEnd('/')}/api/v2?apikey={_config.ApiKey}&cmd=get_history&rating_key={ratingKey}&length=1&order_column=date&order_dir=desc";
+        string keyParam = isShow ? $"grandparent_rating_key={ratingKey}" : $"rating_key={ratingKey}";
+        var url = $"{_config.Url.TrimEnd('/')}/api/v2?apikey={_config.ApiKey}&cmd=get_history&{keyParam}&length=1&order_column=date&order_dir=desc";
         var res = await _http.GetAsync(url);
         if (!res.IsSuccessStatusCode) return null;
 
         var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
         var data = await res.Content.ReadFromJsonAsync<TautulliResponse>(options);
-        if (data?.Response == null) return null;
+        if (data?.Response?.Data == null) return null;
 
-        long lastViewedAt = 0;
-        if (data.Response.Data.ValueKind == JsonValueKind.Array)
-        {
-            var historyItems = data.Response.Data.Deserialize<List<TautulliHistoryItem>>(options);
-            lastViewedAt = historyItems?.FirstOrDefault()?.Date ?? 0;
-        }
+        int playCount = data.Response.Data.RecordsFiltered;
+        long lastViewedAt = data.Response.Data.Data?.FirstOrDefault()?.Date ?? 0;
+
+        // Logger.Log($"[DEBUG] Tautulli Stats for {ratingKey} (IsShow: {isShow}): PlayCount={playCount}, LastViewedAt={lastViewedAt}");
 
         return new TautulliItemStats 
         {
-            PlayCount = data.Response.RecordsFiltered,
+            PlayCount = playCount,
             LastViewedAt = lastViewedAt
         };
     }
 }
 
-public class TautulliResponse { public TautulliResponseData? Response { get; set; } }
-public class TautulliResponseData { 
+// Tautulli API response structure: { response: { data: { recordsFiltered, data: [...] } } }
+public class TautulliResponse { public TautulliResponseWrapper? Response { get; set; } }
+public class TautulliResponseWrapper { public TautulliHistoryData? Data { get; set; } }
+public class TautulliHistoryData {
     public int RecordsFiltered { get; set; }
-    public JsonElement Data { get; set; } 
+    public List<TautulliHistoryItem>? Data { get; set; }
 }
 public class TautulliHistoryItem { 
     public long Date { get; set; } 
